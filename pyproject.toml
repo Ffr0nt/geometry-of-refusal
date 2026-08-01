@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geometry-of-refusal"
+version = "0.1.0"
+description = "Geometry of Refusal (Wollschlager et al.) — fork, made pip/uv-installable for use as an editable dependency."
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "python-dotenv",
+    "nnsight==0.3.7",
+    "torch==2.5.1",
+    "transformers==4.47.0",
+    "accelerate==1.2.0",
+    "einops==0.8.0",
+    "jaxtyping",
+    "tqdm",
+    "wandb",
+    "matplotlib",
+    "seaborn",
+    "plotly",
+    # Linux/GPU-only: у triton нет колёс под macOS — не ставим на локальной машине.
+    "triton==3.1.0 ; sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+# Оценка jailbreak (пайплайн refusal_direction). git-зависимость — ставится по месту:
+eval = ["strong-reject @ git+https://github.com/dsbowen/strong_reject.git@main"]
+dev = ["jupyterlab"]
+
+# Плоская раскладка: ядро — top-level модули в корне репозитория.
+# Пайплайн refusal_direction/ запускается как скрипты (свой source-root) и намеренно
+# не устанавливается как пакет, чтобы не занимать имена pipeline/dataset в глобальном
+# неймспейсе.
+[tool.setuptools]
+py-modules = [
+    "rdo",
+    "scoring",
+    "generate_utils",
+    "plots",
+    "plot_style",
+    "cosinesim_analysis",
+    "monotonic_scaling_property",
+]
