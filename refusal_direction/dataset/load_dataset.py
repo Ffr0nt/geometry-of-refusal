@@ -6,8 +6,11 @@ dataset_dir_path = os.path.dirname(os.path.realpath(__file__))
 SPLITS = ['train', 'val', 'test']
 HARMTYPES = ['harmless', 'harmful']
 
-# SPLIT_DATASET_FILENAME = os.path.join(dataset_dir_path, '../../data/saladbench_splits/{harmtype}_{split}.json')
-SPLIT_DATASET_FILENAME = os.path.join(dataset_dir_path, '../../data/saladbench_splits/{harmtype}_{split}.json')
+# Каталог сплитов управляется env REFUSAL_SPLITS (по умолчанию saladbench).
+# Позволяет пайплайну DIM читать per-rung данные без правки кода:
+#   REFUSAL_SPLITS=theft  ->  data/theft_splits/{harmtype}_{split}.json
+_SPLITS_DIR = os.getenv("REFUSAL_SPLITS", "saladbench")
+SPLIT_DATASET_FILENAME = os.path.join(dataset_dir_path, f'../../data/{_SPLITS_DIR}_splits/{{harmtype}}_{{split}}.json')
 
 PROCESSED_DATASET_NAMES = ["advbench", "tdc2023", "maliciousinstruct", "harmbench_val", "harmbench_test", "jailbreakbench", "strongreject", "alpaca", "xstest", "sorrybench"]
 
