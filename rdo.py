@@ -938,14 +938,18 @@ def refusal_cone_optimization(model, train_dataset,
     save_vectors = vectors
     lowest_loss_index = torch.argmin(torch.tensor(train_losses)).item()
     lowest_loss_vector = save_vectors[lowest_loss_index]
-    run_id = wandb.run.id
-    artifact = wandb.Artifact(f'trained_vectors_run_{run_id}', type='vector')
-    with artifact.new_file(f'vectors.pt', mode='wb') as f:
-        torch.save(save_vectors, f)
-    with artifact.new_file(f'lowest_loss_vector.pt', mode='wb') as f:
-        torch.save(lowest_loss_vector, f)
-    wandb.log_artifact(artifact)
-    
+    try:
+        run_id = wandb.run.id
+        artifact = wandb.Artifact(f'trained_vectors_run_{run_id}', type='vector')
+        with artifact.new_file(f'vectors.pt', mode='wb') as f:
+            torch.save(save_vectors, f)
+        with artifact.new_file(f'lowest_loss_vector.pt', mode='wb') as f:
+            torch.save(lowest_loss_vector, f)
+        wandb.log_artifact(artifact)
+    except Exception as e:
+        # при WANDB_MODE=disabled artifact-логирование недоступно — сохраняем на диск в цикле
+        print(f"[wandb artifact skipped: {e}]")
+
     return {"vectors": vectors, "lowest_loss": lowest_training_loss, "refusal_scores": bypass_scores, "train_losses": train_losses, "lowest_loss_vector": lowest_loss_vector}
 
 # %%
@@ -992,7 +996,7 @@ def train_refusal_vector(group_name=None, run_name=None, orthogonal_vectors=[], 
                    config=wandb_config,
                    group=f"{group_name}_{model_id}",
                    name=run_name,
-                   mode="online"):
+                   mode=os.getenv("WANDB_MODE", "disabled")):
 
         # Run optimization, passing only necessary/overridden args
         results = refusal_cone_optimization(
@@ -1071,7 +1075,7 @@ def train_refusal_cone(group_name, run_name, init_vectors, **kwargs):
                    config=wandb_config,
                    group=f"{group_name}_{model_id}",
                    name=run_name,
-                   mode="online"):
+                   mode=os.getenv("WANDB_MODE", "disabled")):
 
         # Run optimization, passing only necessary/overridden args
         results = refusal_cone_optimization(
@@ -1100,6 +1104,14 @@ if args.train_cone:
         )
         lowest_loss_vector = results['lowest_loss_vector']
         init_vectors = list(lowest_loss_vector)
+        # персист per-d базиса конуса на диск (wandb выключен) для последующей оценки elbow
+        _cone_dir = os.path.join(os.getenv("SAVE_DIR", "./results"), "cones", args.splits)
+        os.makedirs(_cone_dir, exist_ok=True)
+        torch.save({"dim": i, "vectors": lowest_loss_vector,
+                    "train_losses": results.get("train_losses"),
+                    "bypass_scores": results.get("refusal_scores")},
+                   os.path.join(_cone_dir, f"dim_{i}.pt"))
+        print(f"[saved cone dim {i} -> {_cone_dir}/dim_{i}.pt]")
 # %%
 import nnsight
 
@@ -1432,7 +1444,7 @@ def train_independent_vector(group_name=None, run_name=None, independent_vectors
                    config=wandb_config,
                    group=f"{group_name}_{model_id}",
                    name=run_name,
-                   mode="online"):
+                   mode=os.getenv("WANDB_MODE", "disabled")):
         results = repind_rdo(
             model=model,
             train_dataset=train_dataset,
