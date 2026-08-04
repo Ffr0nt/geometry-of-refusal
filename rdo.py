@@ -1101,25 +1101,38 @@ if args.train_cone:
         init_vectors = list(torch.load(_prev, map_location="cpu")["vectors"])
         print(f"[resume: seeded init from {_prev} ({len(init_vectors)} vectors)]")
 
+    # best-of-K: на каждую размерность обучаем K конусов с разной инициализацией
+    # нового вектора и берём лучший по обучающему лоссу (включает L_basis+L_sample —
+    # тянет нижнюю границу ASR). Убирает run-variance («пилу» по d). K=1 => прежнее.
+    best_of_k = int(os.getenv("BEST_OF_K", "1"))
+    base_seed = int(os.getenv("SEED", "21"))
+
     for i in subspace_dimensions:
-        run_name = f"dim_{i}"
-        print(f"Training dimension {i}")
-        results = train_refusal_cone(
-            group_name=group_name, 
-            run_name=run_name, 
-            init_vectors=init_vectors,
-            cone_dim=i
-        )
+        best = None  # (loss, results)
+        for k in range(best_of_k):
+            torch.manual_seed(base_seed * 1000 + i * 10 + k)  # воспроизводимо и различно
+            results = train_refusal_cone(
+                group_name=group_name,
+                run_name=f"dim_{i}_k{k}",
+                init_vectors=init_vectors,
+                cone_dim=i,
+            )
+            loss = float(results.get("lowest_loss"))
+            print(f"[dim {i} candidate {k+1}/{best_of_k}: lowest_loss={loss:.4f}]")
+            if best is None or loss < best[0]:
+                best = (loss, results)
+        results = best[1]
         lowest_loss_vector = results['lowest_loss_vector']
-        init_vectors = list(lowest_loss_vector)
+        init_vectors = list(lowest_loss_vector)  # warm-start следующей d от ЛУЧШЕГО конуса
         # персист per-d базиса конуса на диск (wandb выключен) для последующей оценки elbow
         _cone_dir = os.path.join(os.getenv("SAVE_DIR", "./results"), "cones", args.splits)
         os.makedirs(_cone_dir, exist_ok=True)
         torch.save({"dim": i, "vectors": lowest_loss_vector,
                     "train_losses": results.get("train_losses"),
-                    "bypass_scores": results.get("refusal_scores")},
+                    "bypass_scores": results.get("refusal_scores"),
+                    "best_of_k": best_of_k, "selected_loss": best[0]},
                    os.path.join(_cone_dir, f"dim_{i}.pt"))
-        print(f"[saved cone dim {i} -> {_cone_dir}/dim_{i}.pt]")
+        print(f"[saved cone dim {i} (best-of-{best_of_k}, loss={best[0]:.4f}) -> {_cone_dir}/dim_{i}.pt]")
 # %%
 import nnsight
 
