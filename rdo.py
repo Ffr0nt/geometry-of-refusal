@@ -1093,6 +1093,14 @@ if args.train_cone:
     group_name = "basic_rco"
     init_vectors = []
 
+    # resume: при min_cone_dim>1 подсеять базис из сохранённого dim_{min-1}.pt,
+    # иначе warm-start оборвётся (первый dim обучится со случайной инициализации)
+    if args.min_cone_dim > 1:
+        _prev = os.path.join(os.getenv("SAVE_DIR", "./results"), "cones", args.splits,
+                             f"dim_{args.min_cone_dim - 1}.pt")
+        init_vectors = list(torch.load(_prev, map_location="cpu")["vectors"])
+        print(f"[resume: seeded init from {_prev} ({len(init_vectors)} vectors)]")
+
     for i in subspace_dimensions:
         run_name = f"dim_{i}"
         print(f"Training dimension {i}")
