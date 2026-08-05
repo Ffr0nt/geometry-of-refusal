@@ -1093,11 +1093,16 @@ if args.train_cone:
     group_name = "basic_rco"
     init_vectors = []
 
+    # namespacing по сиду/тегу: конусы в cones/<splits>/<CONE_TAG>/ — чтобы прогоны с
+    # разными сидами (мультисид-усреднение) не перетирали друг друга. CONE_TAG="" => как раньше.
+    cone_tag = os.getenv("CONE_TAG", "")
+    _cone_dir = os.path.join(os.getenv("SAVE_DIR", "./results"), "cones", args.splits, cone_tag)
+    os.makedirs(_cone_dir, exist_ok=True)
+
     # resume: при min_cone_dim>1 подсеять базис из сохранённого dim_{min-1}.pt,
     # иначе warm-start оборвётся (первый dim обучится со случайной инициализации)
     if args.min_cone_dim > 1:
-        _prev = os.path.join(os.getenv("SAVE_DIR", "./results"), "cones", args.splits,
-                             f"dim_{args.min_cone_dim - 1}.pt")
+        _prev = os.path.join(_cone_dir, f"dim_{args.min_cone_dim - 1}.pt")
         init_vectors = list(torch.load(_prev, map_location="cpu")["vectors"])
         print(f"[resume: seeded init from {_prev} ({len(init_vectors)} vectors)]")
 
@@ -1125,14 +1130,13 @@ if args.train_cone:
         lowest_loss_vector = results['lowest_loss_vector']
         init_vectors = list(lowest_loss_vector)  # warm-start следующей d от ЛУЧШЕГО конуса
         # персист per-d базиса конуса на диск (wandb выключен) для последующей оценки elbow
-        _cone_dir = os.path.join(os.getenv("SAVE_DIR", "./results"), "cones", args.splits)
-        os.makedirs(_cone_dir, exist_ok=True)
         torch.save({"dim": i, "vectors": lowest_loss_vector,
                     "train_losses": results.get("train_losses"),
                     "bypass_scores": results.get("refusal_scores"),
-                    "best_of_k": best_of_k, "selected_loss": best[0]},
+                    "best_of_k": best_of_k, "selected_loss": best[0],
+                    "seed": base_seed, "cone_tag": cone_tag},
                    os.path.join(_cone_dir, f"dim_{i}.pt"))
-        print(f"[saved cone dim {i} (best-of-{best_of_k}, loss={best[0]:.4f}) -> {_cone_dir}/dim_{i}.pt]")
+        print(f"[saved cone dim {i} (best-of-{best_of_k}, seed={base_seed}, loss={best[0]:.4f}) -> {_cone_dir}/dim_{i}.pt]")
 # %%
 import nnsight
 
