@@ -1099,12 +1099,20 @@ if args.train_cone:
     _cone_dir = os.path.join(os.getenv("SAVE_DIR", "./results"), "cones", args.splits, cone_tag)
     os.makedirs(_cone_dir, exist_ok=True)
 
-    # resume: при min_cone_dim>1 подсеять базис из сохранённого dim_{min-1}.pt,
-    # иначе warm-start оборвётся (первый dim обучится со случайной инициализации)
-    if args.min_cone_dim > 1:
+    # FROM_SCRATCH=1 => НИКОГДА не подсеивать базис (все оси случайны) — для обучения конуса
+    # нужной размерности независимо, без вложенной лестницы. Иначе (по умолчанию):
+    # resume при min_cone_dim>1 подсеивает базис из dim_{min-1}.pt, ЕСЛИ он есть; если файла
+    # нет — обучаем с НУЛЯ (init_vectors=[] => все оси случайны, см. RefusalCone.__init__).
+    _from_scratch = os.getenv("FROM_SCRATCH", "0") == "1"
+    if _from_scratch:
+        print(f"[FROM_SCRATCH=1: dim {args.min_cone_dim}..{args.max_cone_dim} со случайной инициализацией, resume отключён]")
+    elif args.min_cone_dim > 1:
         _prev = os.path.join(_cone_dir, f"dim_{args.min_cone_dim - 1}.pt")
-        init_vectors = list(torch.load(_prev, map_location="cpu")["vectors"])
-        print(f"[resume: seeded init from {_prev} ({len(init_vectors)} vectors)]")
+        if os.path.exists(_prev):
+            init_vectors = list(torch.load(_prev, map_location="cpu")["vectors"])
+            print(f"[resume: seeded init from {_prev} ({len(init_vectors)} vectors)]")
+        else:
+            print(f"[from-scratch: {_prev} не найден — dim {args.min_cone_dim} обучается со случайной инициализации]")
 
     # best-of-K: на каждую размерность обучаем K конусов с разной инициализацией
     # нового вектора и берём лучший по обучающему лоссу (включает L_basis+L_sample —
