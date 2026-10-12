@@ -140,7 +140,20 @@ def parse_args():
                     help='Batch size for filtering data')
     parser.add_argument('--splits', type=str, default=DEFAULT_CONFIG['splits'],
                     help='Dataset split to use')
-    
+
+    # Явные пути вместо env/cwd (по умолчанию — прежнее поведение)
+    parser.add_argument('--dim_dir', type=str, default=None,
+                    help='Каталог DIM: direction.pt, direction_metadata.json, generate_directions/mean_diffs.pt')
+    parser.add_argument('--splits_dir', type=str, default=None,
+                    help='Каталог сплитов (harmful_train.json, harmless_train.json)')
+    parser.add_argument('--targets_dir', type=str, default=None,
+                    help='Каталог кэша таргетов')
+    # Одномерные конусы с явными сидами: по файлу seed_<s>.pt на сид
+    parser.add_argument('--seeds', type=int, nargs='+', default=None,
+                    help='Обучить по одному одномерному конусу на каждый сид')
+    parser.add_argument('--out_dir', type=str, default=None,
+                    help='Куда сохранять seed_<s>.pt (для --seeds)')
+
     return parser.parse_args()
 
 args = parse_args()
@@ -171,7 +184,7 @@ with model.trace("Hello") as tracer:
 
 # %%
 model_id = MODEL_PATH.split("/")[-1]
-dim_dir_path = f"{os.getenv('SAVE_DIR')}/{os.getenv('DIM_DIR')}/{model_id}"
+dim_dir_path = args.dim_dir or f"{os.getenv('SAVE_DIR')}/{os.getenv('DIM_DIR')}/{model_id}"
 direction_file = f"{dim_dir_path}/direction.pt"
 metadata_file = f"{dim_dir_path}/direction_metadata.json"
 mean_diffs_file = f"{dim_dir_path}/generate_directions/mean_diffs.pt"
@@ -190,15 +203,17 @@ best_refusal_direction = torch.load(direction_file).to(model.dtype)
 
 # %%
 SAVE_DIR = f"{os.getenv('SAVE_DIR')}/rdo/{MODEL_PATH.split('/')[-1]}/"
-os.makedirs(SAVE_DIR, exist_ok=True)
+if not args.out_dir:
+    os.makedirs(SAVE_DIR, exist_ok=True)
 
 add_layer = best_layer
 alpha = best_refusal_direction.norm().detach().clone()
 print(f"add_layer: {add_layer}, alpha: {alpha}")
 
 # %%
-harmful_train = json.load(open(f'data/{splits}_splits/harmful_train.json'))
-harmless_train = json.load(open(f'data/{splits}_splits/harmless_train.json'))
+splits_dir = args.splits_dir or f'data/{splits}_splits'
+harmful_train = json.load(open(f'{splits_dir}/harmful_train.json'))
+harmless_train = json.load(open(f'{splits_dir}/harmless_train.json'))
 
 harmless_train = harmless_train[:len(harmful_train)]
 print(len(harmful_train), len(harmless_train))
@@ -325,8 +340,9 @@ def generate_harmless_targets(model, harmless_instructions, targets_path, max_ne
 num_target_tokens = 30
 
 # Set up paths
-harmful_targets_path = f"{os.getenv('SAVE_DIR')}/rdo/{model_id}/{splits}/targets/harmful_targets.json"
-harmless_targets_path = f"{os.getenv('SAVE_DIR')}/rdo/{model_id}/{splits}/targets/harmless_targets.json"
+targets_dir = args.targets_dir or f"{os.getenv('SAVE_DIR')}/rdo/{model_id}/{splits}/targets"
+harmful_targets_path = f"{targets_dir}/harmful_targets.json"
+harmless_targets_path = f"{targets_dir}/harmless_targets.json"
 
 # Generate all targets
 harmful_targets = generate_harmful_targets(model, harmful_train_instructions, best_refusal_direction, harmful_targets_path, num_target_tokens)
@@ -1145,6 +1161,37 @@ if args.train_cone:
                     "seed": base_seed, "cone_tag": cone_tag},
                    os.path.join(_cone_dir, f"dim_{i}.pt"))
         print(f"[saved cone dim {i} (best-of-{best_of_k}, seed={base_seed}, loss={best[0]:.4f}) -> {_cone_dir}/dim_{i}.pt]")
+
+# %%
+# Одномерные конусы с явными сидами. Сид задаёт и стартовый вектор (он сохраняется вместе с
+# результатом — по нему проверяется, что общность векторов не следствие общего старта), и
+# порядок батчей. Уже обученные сиды пропускаются.
+if args.seeds:
+    assert args.out_dir, "--seeds требует --out_dir"
+    os.makedirs(args.out_dir, exist_ok=True)
+    for s in args.seeds:
+        out_path = os.path.join(args.out_dir, f"seed_{s:02d}.pt")
+        if os.path.exists(out_path):
+            print(f"[seed {s}: {out_path} уже есть — пропуск]")
+            continue
+        torch.manual_seed(s)
+        init_vector = torch.randn(model.config.hidden_size, dtype=torch.float32)
+        init_vector = init_vector / init_vector.norm()
+        results = train_refusal_cone(
+            group_name="seeded_rdo",
+            run_name=f"seed_{s}",
+            init_vectors=[init_vector],
+            cone_dim=1,
+        )
+        torch.save({"vector": results["lowest_loss_vector"][0],
+                    "init_vector": init_vector,
+                    "seed": s,
+                    "add_layer": add_layer,
+                    "lowest_loss": results["lowest_loss"],
+                    "train_losses": results["train_losses"],
+                    "bypass_scores": results["refusal_scores"]},
+                   out_path)
+        print(f"[seed {s}: lowest_loss={results['lowest_loss']:.4f} -> {out_path}]")
 # %%
 import nnsight
 
