@@ -153,6 +153,12 @@ def parse_args():
                     help='Обучить по одному одномерному конусу на каждый сид')
     parser.add_argument('--out_dir', type=str, default=None,
                     help='Куда сохранять seed_<s>.pt (для --seeds)')
+    # Шаблон чата и refusal-токены извне (единый источник — вызывающий код); без них —
+    # прежний выбор по имени модели
+    parser.add_argument('--chat_template', type=str, default=None,
+                    help='Шаблон промпта с единственным {instruction}')
+    parser.add_argument('--refusal_toks', type=int, nargs='+', default=None,
+                    help='id токенов, с которых начинается отказ')
 
     return parser.parse_args()
 
@@ -236,7 +242,9 @@ LLAMA3_CHAT_TEMPLATE = """<|begin_of_text|><|start_header_id|>user<|end_header_i
 """
 
 def apply_chat_template(tokenizer, instructions: list[str]):
-    if 'llama-3' in MODEL_PATH.lower():
+    if getattr(args, 'chat_template', None):
+        prompts = [args.chat_template.format(instruction=inst) for inst in instructions]
+    elif 'llama-3' in MODEL_PATH.lower():
         prompts = [LLAMA3_CHAT_TEMPLATE.format(instruction=inst) for inst in instructions]
     elif "gemma" in MODEL_PATH.lower():
         prompts = [GEMMA_CHAT_TEMPLATE.format(instruction=inst) for inst in instructions]
@@ -272,7 +280,9 @@ print("Example first tokens:")
 print(example_tokens)
 
 # %%
-if "gemma" in MODEL_PATH.lower():
+if getattr(args, 'refusal_toks', None):
+    refusal_tokens = list(args.refusal_toks)
+elif "gemma" in MODEL_PATH.lower():
     refusal_tokens = [235285]
 elif "qwen2.5" in MODEL_PATH.lower():
     refusal_tokens = [40, 2121]
