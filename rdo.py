@@ -61,6 +61,11 @@ DEFAULT_CONFIG = {
     'free_norm': False,
     'norm_lambda': 0.0,
 
+    # Addition term: 'refuse' — CE on refusal targets under +alpha*r (the paper);
+    # 'invariant' — KL to the clean model on harmless prompts under +alpha*r AND -alpha*r
+    # (adding the direction in either sign must change nothing), weighted by addition_lambda
+    'addition_mode': 'refuse',
+
     # Miscellaneous
     'target_generation_batch_size': 512,  # Batch size for generating targets
     'filter_data': True,              # Whether to filter data
@@ -139,6 +144,10 @@ def parse_args():
                     help='Одномерный вектор без нормировки: добавление alpha*z, аблация и retain — по z/||z||')
     parser.add_argument('--norm_lambda', type=float, default=DEFAULT_CONFIG['norm_lambda'],
                     help='Вес штрафа norm_lambda*||z||^2 (только с --free_norm)')
+    parser.add_argument('--addition_mode', type=str, default=DEFAULT_CONFIG['addition_mode'],
+                    choices=['refuse', 'invariant'],
+                    help='refuse — добавление наводит отказ (статья); invariant — добавление ±alpha*r '
+                         'не меняет выход на harmless (KL к чистой модели), вес — addition_lambda')
 
     # Miscellaneous
     parser.add_argument('--target_generation_batch_size', type=int, default=DEFAULT_CONFIG['target_generation_batch_size'],
@@ -178,6 +187,8 @@ args = parse_args()
 # молча игнорировались бы.
 DEFAULT_CONFIG.update({k: v for k, v in vars(args).items() if k in DEFAULT_CONFIG})
 assert not (DEFAULT_CONFIG['norm_lambda'] and not DEFAULT_CONFIG['free_norm']), "--norm_lambda требует --free_norm"
+assert not (DEFAULT_CONFIG['addition_mode'] == 'invariant' and DEFAULT_CONFIG['free_norm']), \
+    "--addition_mode invariant несовместим с --free_norm (норме не на что опереться)"
 MODEL_PATH = args.model
 
 # Apply configuration values
@@ -712,13 +723,16 @@ def refusal_cone_optimization(model, train_dataset,
                               n_lr_reduce=DEFAULT_CONFIG['n_lr_reduce'], 
                               orthogonal_vectors=[],
                               free_norm=DEFAULT_CONFIG['free_norm'],
-                              norm_lambda=DEFAULT_CONFIG['norm_lambda']):
+                              norm_lambda=DEFAULT_CONFIG['norm_lambda'],
+                              addition_mode=DEFAULT_CONFIG['addition_mode']):
 
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=custom_collate)
 
     operation = RefusalCone(model.model, model.config.hidden_size, cone_dim, init_vectors=init_vectors, orthogonal_vectors=orthogonal_vectors, free_norm=free_norm)
-    print(f"Loss weights: ablation={ablation_lambda} addition={addition_lambda} retain={retain_lambda} "
-          f"free_norm={free_norm} norm={norm_lambda}  lr={lr}")
+    print(f"Loss weights: ablation={ablation_lambda} addition={addition_lambda} ({addition_mode}) "
+          f"retain={retain_lambda} free_norm={free_norm} norm={norm_lambda}  lr={lr}")
+    # invariant реализован только для базисных векторов (одномерный конус: n_sample обнуляется ниже)
+    assert addition_mode == 'refuse' or cone_dim == 1, "--addition_mode invariant — только одномерный конус"
 
     optimizer = torch.optim.AdamW(operation.parameters(), lr=lr, betas=(.9,.98), weight_decay=0.0, amsgrad=True)
 
@@ -826,7 +840,25 @@ def refusal_cone_optimization(model, train_dataset,
                             (ablation_lambda * basis_ablation_loss).backward()
                         batch_basis_ablation_loss += log
 
-                    if addition_lambda > 0:
+                    if addition_lambda > 0 and addition_mode == 'invariant':
+                        # добавление ±alpha*r на harmless не должно менять выход: KL к чистой
+                        # модели на тех же позициях, что retain; оба знака — чтобы вектор не ушёл
+                        # в ось, которая при добавлении подавляет отказ
+                        with model.trace() as tracer:
+                            with tracer.invoke(retain_prompt):
+                                clean_logits = model.lm_head.output[:, -num_target_tokens:]
+                            with tracer.invoke(retain_prompt):
+                                operation.add(fn_vector, alpha, add_layer)
+                                plus_logits = model.lm_head.output[:, -num_target_tokens:]
+                            with tracer.invoke(retain_prompt):
+                                operation.add(-fn_vector, alpha, add_layer)
+                                minus_logits = model.lm_head.output[:, -num_target_tokens:]
+                                basis_addition_loss = (kl_div_fn(clean_logits, plus_logits).mean()
+                                                       + kl_div_fn(clean_logits, minus_logits).mean()) / 2 / cone_dim
+                                log = basis_addition_loss.detach().item().save()
+                            (addition_lambda * basis_addition_loss).backward()
+                        batch_basis_addition_loss += log
+                    elif addition_lambda > 0:
                         with model.trace() as tracer:
                             with tracer.invoke(addition_prompt):
                                 operation.add(fn_vector, alpha, add_layer)
@@ -1255,7 +1287,7 @@ if args.seeds:
                     "vector_norm": float(results["lowest_loss_vector"][0].norm()),
                     "loss_weights": {k: DEFAULT_CONFIG[k] for k in
                                      ("ablation_lambda", "addition_lambda", "retain_lambda",
-                                      "free_norm", "norm_lambda")},
+                                      "free_norm", "norm_lambda", "addition_mode")},
                     "lowest_loss": results["lowest_loss"],
                     "train_losses": results["train_losses"],
                     "bypass_scores": results["refusal_scores"],
