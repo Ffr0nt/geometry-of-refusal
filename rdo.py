@@ -55,7 +55,12 @@ DEFAULT_CONFIG = {
     'ablation_lambda': 1,             # Weight for the ablation loss
     'addition_lambda': 0.2,           # Weight for the addition loss
     'retain_lambda': 1,               # Weight for the retain loss
-    
+
+    # Free-norm mode (cone_dim=1 only): addition uses alpha*z with an unnormalized z
+    # (unit at init), ablation/retain use z/||z||; the loss gets norm_lambda*||z||^2
+    'free_norm': False,
+    'norm_lambda': 0.0,
+
     # Miscellaneous
     'target_generation_batch_size': 512,  # Batch size for generating targets
     'filter_data': True,              # Whether to filter data
@@ -130,7 +135,11 @@ def parse_args():
                     help='Weight for the addition loss')
     parser.add_argument('--retain_lambda', type=float, default=DEFAULT_CONFIG['retain_lambda'],
                     help='Weight for the retain loss')
-    
+    parser.add_argument('--free_norm', action='store_true',
+                    help='Одномерный вектор без нормировки: добавление alpha*z, аблация и retain — по z/||z||')
+    parser.add_argument('--norm_lambda', type=float, default=DEFAULT_CONFIG['norm_lambda'],
+                    help='Вес штрафа norm_lambda*||z||^2 (только с --free_norm)')
+
     # Miscellaneous
     parser.add_argument('--target_generation_batch_size', type=int, default=DEFAULT_CONFIG['target_generation_batch_size'],
                     help='Batch size for generating targets')
@@ -163,6 +172,12 @@ def parse_args():
     return parser.parse_args()
 
 args = parse_args()
+# Значения по умолчанию у refusal_cone_optimization и repind_rdo берутся из DEFAULT_CONFIG в
+# момент определения функций (ниже), а train_refusal_cone/train_refusal_vector передают им
+# только init_vectors и cone_dim. Без этой строки флаги --lr, --*_lambda, --n_sample и т.п.
+# молча игнорировались бы.
+DEFAULT_CONFIG.update({k: v for k, v in vars(args).items() if k in DEFAULT_CONFIG})
+assert not (DEFAULT_CONFIG['norm_lambda'] and not DEFAULT_CONFIG['free_norm']), "--norm_lambda требует --free_norm"
 MODEL_PATH = args.model
 
 # Apply configuration values
@@ -579,16 +594,24 @@ def clip_grad_norm(grad, max_norm):
 
 
 class RefusalCone(nn.Module):
-    def __init__(self, module: Envoy, dim: int, n_vectors: int, init_vectors: torch.Tensor | None = None, orthogonal_vectors: torch.Tensor | None = None) -> None:
+    def __init__(self, module: Envoy, dim: int, n_vectors: int, init_vectors: torch.Tensor | None = None, orthogonal_vectors: torch.Tensor | None = None, free_norm: bool = False) -> None:
         super(RefusalCone, self).__init__()
         self.module = module
         self.n_vectors = n_vectors
+        # free_norm: вектор z не нормируется (старт — единичный); add() добавляет alpha*z,
+        # аблация (__call__) по-прежнему идёт по z/||z||
+        self.free_norm = free_norm
+        assert not free_norm or (n_vectors == 1 and not orthogonal_vectors), \
+            "free_norm — только для одномерного конуса без ортогональных ограничений"
         self.fn_vectors = [torch.nn.Parameter(torch.randn(dim, dtype=torch.float32).cuda(), requires_grad=True) for _ in range(n_vectors)]
         if init_vectors is not None:
             for i, init_vector in enumerate(init_vectors):
                 init_vector = init_vector / init_vector.norm()
                 self.fn_vectors[i].data = init_vector.detach().clone().cuda().to(torch.float32)
         self.orthogonal_vectors = [(o / o.norm()).to(torch.float32).cpu() for o in orthogonal_vectors]
+        if free_norm:   # старт — единичный вектор, как у обычного RDO: alpha*z = alpha*z/||z||
+            with torch.no_grad():
+                self.fn_vectors[0].data.div_(self.fn_vectors[0].data.norm())
         self.orthogonalize()
     
     def __call__(self, direction):
@@ -619,7 +642,8 @@ class RefusalCone(nn.Module):
         layer.input = new_activation
 
     def add(self, direction, alpha, layer_idx):
-        direction = direction / direction.norm()
+        if not self.free_norm:
+            direction = direction / direction.norm()
         direction = direction.to(model.dtype)
         self.module.layers[layer_idx].input += alpha * direction
     
@@ -633,6 +657,8 @@ class RefusalCone(nn.Module):
         return self.fn_vectors
     
     def orthogonalize(self):
+        if self.free_norm:   # один вектор, норма свободна — нечего ортогонализовать
+            return
         with torch.no_grad():
             for i in range(len(self.fn_vectors)):
                 for j in range(i):
@@ -684,11 +710,15 @@ def refusal_cone_optimization(model, train_dataset,
                               patience=DEFAULT_CONFIG['patience'], 
                               init_vectors=[], 
                               n_lr_reduce=DEFAULT_CONFIG['n_lr_reduce'], 
-                              orthogonal_vectors=[]):
+                              orthogonal_vectors=[],
+                              free_norm=DEFAULT_CONFIG['free_norm'],
+                              norm_lambda=DEFAULT_CONFIG['norm_lambda']):
 
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=custom_collate)
 
-    operation = RefusalCone(model.model, model.config.hidden_size, cone_dim, init_vectors=init_vectors, orthogonal_vectors=orthogonal_vectors)
+    operation = RefusalCone(model.model, model.config.hidden_size, cone_dim, init_vectors=init_vectors, orthogonal_vectors=orthogonal_vectors, free_norm=free_norm)
+    print(f"Loss weights: ablation={ablation_lambda} addition={addition_lambda} retain={retain_lambda} "
+          f"free_norm={free_norm} norm={norm_lambda}  lr={lr}")
 
     optimizer = torch.optim.AdamW(operation.parameters(), lr=lr, betas=(.9,.98), weight_decay=0.0, amsgrad=True)
 
@@ -703,6 +733,8 @@ def refusal_cone_optimization(model, train_dataset,
     stopped = False
     lowest_training_loss = float('inf')
     bypass_scores = []
+    induce_scores = []
+    vector_norms = []
     patience_counter = 0
     lr_reduce_counter = 0
 
@@ -715,6 +747,7 @@ def refusal_cone_optimization(model, train_dataset,
     batch_basis_ablation_loss = 0.0
     batch_basis_addition_loss = 0.0
     batch_basis_retain_loss = 0.0
+    batch_norm_loss = 0.0
 
     batch_sample_bypass_scores = []
     batch_sample_induce_scores = []
@@ -814,7 +847,15 @@ def refusal_cone_optimization(model, train_dataset,
                                 log = basis_retain_loss.detach().item().save()
                             (retain_lambda * basis_retain_loss).backward()
                         batch_basis_retain_loss += log
-                
+
+            if norm_lambda > 0:
+                # штраф на норму несведённого вектора: градиент гасит компоненты, которые не
+                # нужны addition-слагаемому (аблация и retain от нормы не зависят)
+                for fn_vector in operation.fn_vectors:
+                    norm_loss = norm_lambda * fn_vector.pow(2).sum()
+                    norm_loss.backward()
+                    batch_norm_loss += norm_loss.detach().item()
+
             with torch.no_grad():
                 with model.trace() as tracer:
                     for fn_vector in operation.fn_vectors:
@@ -851,8 +892,9 @@ def refusal_cone_optimization(model, train_dataset,
 
                 step_counter += 1
                 if step_counter % accumulation_steps == 0:
-                    for fn_vector in operation.fn_vectors:
-                        fn_vector.grad.sub_(projection_einops(fn_vector.grad, fn_vector.data))
+                    if not free_norm:   # шаг по касательной к сфере; при free_norm норма учится
+                        for fn_vector in operation.fn_vectors:
+                            fn_vector.grad.sub_(projection_einops(fn_vector.grad, fn_vector.data))
                     for fn_vector in operation.fn_vectors:
                         fn_vector.grad.div_(accumulation_steps)
                     torch.nn.utils.clip_grad_norm_(operation.parameters(), 10.0)
@@ -871,8 +913,9 @@ def refusal_cone_optimization(model, train_dataset,
                     batch_basis_ablation_loss /= accumulation_steps
                     batch_basis_addition_loss /= accumulation_steps
                     batch_basis_retain_loss /= accumulation_steps
+                    batch_norm_loss /= accumulation_steps
 
-                    train_loss = batch_sample_ablation_loss + batch_sample_addition_loss + batch_sample_retain_loss + batch_basis_ablation_loss + batch_basis_addition_loss + batch_basis_retain_loss
+                    train_loss = batch_sample_ablation_loss + batch_sample_addition_loss + batch_sample_retain_loss + batch_basis_ablation_loss + batch_basis_addition_loss + batch_basis_retain_loss + batch_norm_loss
                     train_losses.append(train_loss)
 
                     batch_basis_bypass_scores = [s.value for s in batch_basis_bypass_scores]
@@ -882,12 +925,16 @@ def refusal_cone_optimization(model, train_dataset,
 
                     vectors.append(torch.stack(operation.fn_vectors, dim=0).detach().cpu().data.clone())
                     bypass_scores.append(basis_bypass_scores)
+                    induce_scores.append(basis_induce_scores)
+                    vector_norms.append([v.data.norm().item() for v in operation.fn_vectors])
 
                     wandb_logs = {
                         "train/total_loss": train_loss,
                         "train/basis_ablation_loss": batch_basis_ablation_loss,
                         "train/basis_addition_loss": batch_basis_addition_loss,
                         "train/basis_retain_loss": batch_basis_retain_loss,
+                        "train/norm_loss": batch_norm_loss,
+                        "train/vector_norm": [v.data.norm().item() for v in operation.fn_vectors],
                         "train/basis_bypass_score": basis_bypass_scores,
                         "train/basis_induce_score": basis_induce_scores,
                         "train/grad_norm": grad_norm
@@ -926,6 +973,10 @@ def refusal_cone_optimization(model, train_dataset,
                     wandb.log(wandb_logs, step=step_counter)
 
                     print("Step", step_counter, "train/basis_vector_bypass_score", [round(s, 2) for s in basis_bypass_scores], "train/basis_vector_induce_score", [round(s, 2) for s in basis_induce_scores])
+                    if free_norm:
+                        print("  loss: abl", round(batch_basis_ablation_loss, 3), "add", round(batch_basis_addition_loss, 3),
+                              "ret", round(batch_basis_retain_loss, 3), "norm", round(batch_norm_loss, 3),
+                              "||z||", round(operation.fn_vectors[0].data.norm().item(), 3))
                     
                     if n_sample > 0:
                         print("train/mean_sample_bypass_scores", round(mean_sample_bypass_score, 2), "train/mean_sample_induce_scores", round(mean_sample_induce_score, 2))
@@ -950,6 +1001,7 @@ def refusal_cone_optimization(model, train_dataset,
                     batch_basis_ablation_loss = 0.
                     batch_basis_addition_loss = 0.
                     batch_basis_retain_loss = 0.
+                    batch_norm_loss = 0.
 
                     batch_sample_bypass_scores = []
                     batch_sample_induce_scores = []
@@ -976,7 +1028,8 @@ def refusal_cone_optimization(model, train_dataset,
         # при WANDB_MODE=disabled artifact-логирование недоступно — сохраняем на диск в цикле
         print(f"[wandb artifact skipped: {e}]")
 
-    return {"vectors": vectors, "lowest_loss": lowest_training_loss, "refusal_scores": bypass_scores, "train_losses": train_losses, "lowest_loss_vector": lowest_loss_vector}
+    return {"vectors": vectors, "lowest_loss": lowest_training_loss, "refusal_scores": bypass_scores, "train_losses": train_losses, "lowest_loss_vector": lowest_loss_vector,
+            "induce_scores": induce_scores, "vector_norms": vector_norms, "lowest_loss_index": lowest_loss_index}
 
 # %%
 def train_refusal_vector(group_name=None, run_name=None, orthogonal_vectors=[], **kwargs):
@@ -1197,9 +1250,18 @@ if args.seeds:
                     "init_vector": init_vector,
                     "seed": s,
                     "add_layer": add_layer,
+                    "alpha": float(alpha),
+                    # при free_norm vector не единичный: добавление в обучении шло как alpha*vector
+                    "vector_norm": float(results["lowest_loss_vector"][0].norm()),
+                    "loss_weights": {k: DEFAULT_CONFIG[k] for k in
+                                     ("ablation_lambda", "addition_lambda", "retain_lambda",
+                                      "free_norm", "norm_lambda")},
                     "lowest_loss": results["lowest_loss"],
                     "train_losses": results["train_losses"],
-                    "bypass_scores": results["refusal_scores"]},
+                    "bypass_scores": results["refusal_scores"],
+                    "induce_scores": results["induce_scores"],
+                    "vector_norms": results["vector_norms"],
+                    "lowest_loss_index": results["lowest_loss_index"]},
                    out_path)
         print(f"[seed {s}: lowest_loss={results['lowest_loss']:.4f} -> {out_path}]")
 # %%
