@@ -855,7 +855,10 @@ def refusal_cone_optimization(model, train_dataset,
                                 minus_logits = model.lm_head.output[:, -num_target_tokens:]
                                 basis_addition_loss = (kl_div_fn(clean_logits, plus_logits).mean()
                                                        + kl_div_fn(clean_logits, minus_logits).mean()) / 2 / cone_dim
-                                log = basis_addition_loss.detach().item().save()
+                                # в train_loss — с весом: по нему ранняя остановка и выбор
+                                # сохраняемого вектора. Без веса они шли бы по L_inv с весом 1 при
+                                # любом addition_lambda. В режиме refuse лог без веса, как в статье.
+                                log = (addition_lambda * basis_addition_loss).detach().item().save()
                             (addition_lambda * basis_addition_loss).backward()
                         batch_basis_addition_loss += log
                     elif addition_lambda > 0:
